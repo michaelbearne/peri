@@ -165,6 +165,7 @@ defmodule Peri do
           | :pid
           | {:either, {schema_def, schema_def}}
           | {:oneof, list(schema_def)}
+          | {:anyof, list(schema_def)}
           | {:required, schema_def}
           | {:enum, list(term)}
           | {:list, schema_def}
@@ -208,12 +209,37 @@ defmodule Peri do
       MySchemas.user(invalid_data)
       # => {:error, [email: "is required"]}
   """
-  defmacro defschema(name, schema) do
+  defmacro defschema(name, schema) when is_atom(name) do
     bang = :"#{name}!"
 
     quote do
       def get_schema(unquote(name)) do
         unquote(schema)
+      end
+
+      def unquote(name)(data) do
+        with {:ok, schema} <- Peri.validate_schema(unquote(schema)) do
+          Peri.validate(schema, data)
+        end
+      end
+
+      def unquote(bang)(data) do
+        with {:ok, valid_schema} <- Peri.validate_schema(unquote(schema)),
+             {:ok, valid_data} <- Peri.validate(valid_schema, data) do
+          valid_data
+        else
+          {:error, errors} -> raise Peri.InvalidSchema, errors
+        end
+      end
+    end
+  end
+
+  defmacro defschema({name, description}, schema) when is_atom(name) and is_binary(description) do
+    bang = :"#{name}!"
+
+    quote do
+      def get_schema(unquote(name)) do
+        unquote({schema, description})
       end
 
       def unquote(name)(data) do
@@ -548,19 +574,71 @@ defmodule Peri do
 
   @doc false
   defp validate_field(nil, nil, _data), do: :ok
+  defp validate_field(nil, {nil, description}, _data) when is_binary(description), do: :ok
   defp validate_field(_, :any, _data), do: :ok
+  defp validate_field(_, {:any, description}, _data) when is_binary(description), do: :ok
   defp validate_field(pid, :pid, _data) when is_pid(pid), do: :ok
+
+  defp validate_field(pid, {:pid, description}, _data)
+       when is_pid(pid) and is_binary(description),
+       do: :ok
+
   defp validate_field(%Date{}, :date, _data), do: :ok
+  defp validate_field(%Date{}, {:date, description}, _data) when is_binary(description), do: :ok
   defp validate_field(%Time{}, :time, _data), do: :ok
+  defp validate_field(%Time{}, {:time, description}, _data) when is_binary(description), do: :ok
   defp validate_field(%DateTime{}, :datetime, _data), do: :ok
+
+  defp validate_field(%DateTime{}, {:datetime, description}, _data) when is_binary(description),
+    do: :ok
+
   defp validate_field(%NaiveDateTime{}, :naive_datetime, _data), do: :ok
+
+  defp validate_field(%NaiveDateTime{}, {:naive_datetime, description}, _data)
+       when is_binary(description),
+       do: :ok
+
   defp validate_field(val, :atom, _data) when is_atom(val), do: :ok
+
+  defp validate_field(val, {:atom, description}, _data)
+       when is_atom(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :map, _data) when is_map(val), do: :ok
+
+  defp validate_field(val, {:map, description}, _data)
+       when is_map(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :string, _data) when is_binary(val), do: :ok
+
+  defp validate_field(val, {:string, description}, _data)
+       when is_binary(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :integer, _data) when is_integer(val), do: :ok
+
+  defp validate_field(val, {:integer, description}, _data)
+       when is_integer(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :float, _data) when is_float(val), do: :ok
+
+  defp validate_field(val, {:float, description}, _data)
+       when is_float(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :boolean, _data) when is_boolean(val), do: :ok
+
+  defp validate_field(val, {:boolean, description}, _data)
+       when is_boolean(val) and is_binary(description),
+       do: :ok
+
   defp validate_field(val, :list, _data) when is_list(val), do: :ok
+
+  defp validate_field(val, {:list, description}, _data)
+       when is_list(val) and is_binary(description),
+       do: :ok
 
   defp validate_field(val, {:literal, literal}, _data) when val === literal, do: :ok
 
@@ -587,6 +665,10 @@ defmodule Peri do
     do: {:error, "cannot be empty", []}
 
   defp validate_field([], {:required, {:list, _}}, _data), do: {:error, "cannot be empty", []}
+
+  defp validate_field(val, {:required, type, description}, data) when is_binary(description),
+    do: validate_field(val, type, data)
+
   defp validate_field(val, {:required, type}, data), do: validate_field(val, type, data)
 
   defp validate_field(val, {:string, {:regex, regex}}, _data) when is_binary(val) do
@@ -866,6 +948,32 @@ defmodule Peri do
     end)
   end
 
+  defp validate_field(val, {:anyof, types}, data) do
+    types
+    |> Enum.reduce_while(:error, fn type, :error ->
+      case validate_field(val, type, data) do
+        :ok -> {:halt, :ok}
+        {:ok, val} -> {:halt, {:ok, val}}
+        {:error, _reason, _info} -> {:cont, :error}
+        {:error, _errors} -> {:cont, :error}
+      end
+    end)
+    |> then(fn
+      :ok ->
+        :ok
+
+      {:ok, val} ->
+        {:ok, val}
+
+      :error ->
+        expected = Enum.map_join(types, " or ", &inspect/1)
+        info = [anyof: expected, actual: inspect(val)]
+        template = "expected any of %{anyof}, got: %{actual}"
+
+        {:error, template, info}
+    end)
+  end
+
   defp validate_field(source, {:tuple, types}, data) when is_tuple(source) do
     if tuple_size(source) == length(types) do
       validate_tuple_elements(source, types, data)
@@ -1082,19 +1190,36 @@ defmodule Peri do
   end
 
   defp validate_type(nil, _parser), do: :ok
+  defp validate_type({nil, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:any, _parser), do: :ok
+  defp validate_type({:any, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:atom, _parser), do: :ok
+  defp validate_type({:atom, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:integer, _parser), do: :ok
+  defp validate_type({:integer, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:map, _parser), do: :ok
+  defp validate_type({:map, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:float, _parser), do: :ok
+  defp validate_type({:float, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:boolean, _parser), do: :ok
+  defp validate_type({:boolean, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:string, _parser), do: :ok
+  defp validate_type({:string, description}, _parser) when is_binary(description), do: :ok
   defp validate_type({:literal, _literal}, _parser), do: :ok
+
+  defp validate_type({:literal, _literal, description}, _parser) when is_binary(description),
+    do: :ok
+
   defp validate_type(:date, _parser), do: :ok
+  defp validate_type({:date, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:time, _parser), do: :ok
+  defp validate_type({:time, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:datetime, _parser), do: :ok
+  defp validate_type({:datetime, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:naive_datetime, _parser), do: :ok
+  defp validate_type({:naive_datetime, description}, _parser) when is_binary(description), do: :ok
   defp validate_type(:pid, _parser), do: :ok
+  defp validate_type({:pid, description}, _parser) when is_binary(description), do: :ok
   defp validate_type({type, {:default, _val}}, p), do: validate_type(type, p)
   defp validate_type({:enum, choices}, _) when is_list(choices), do: :ok
 
@@ -1147,6 +1272,9 @@ defmodule Peri do
     template = "cannot set default value of %{value} for required field of type %{type}"
     {:error, template, [value: val, type: type]}
   end
+
+  defp validate_type({:required, type, description}, p) when is_binary(description),
+    do: validate_type(type, p)
 
   defp validate_type({:required, type}, p), do: validate_type(type, p)
   defp validate_type({:list, type}, p), do: validate_type(type, p)
@@ -1203,6 +1331,24 @@ defmodule Peri do
     end)
   end
 
+  # todo is this different to oneof should oneof check all types of an array are the same
+  defp validate_type({:anyof, types}, p) do
+    Enum.reduce_while(types, :ok, fn type, :ok ->
+      case validate_type(type, p) do
+        :ok -> {:cont, :ok}
+        {:error, errors} -> {:halt, {:error, errors}}
+        {:error, template, info} -> {:halt, {:error, template, info}}
+      end
+    end)
+  end
+
+  defp validate_type({schema, _description}, p) when is_enumerable(schema) do
+    case traverse_definition(schema, p) do
+      %Peri.Parser{errors: []} -> :ok
+      %Peri.Parser{errors: errors} -> {:error, errors}
+    end
+  end
+
   defp validate_type(schema, p) when is_enumerable(schema) do
     case traverse_definition(schema, p) do
       %Peri.Parser{errors: []} -> :ok
@@ -1213,6 +1359,351 @@ defmodule Peri do
   defp validate_type(invalid, _p) do
     invalid = inspect(invalid, pretty: true)
     {:error, "invalid schema definition: %{invalid}", invalid: invalid}
+  end
+
+  # https://spec.openapis.org/oas/v3.0.3#schema-object
+  # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/function-calling
+
+  def to_open_api({:list, def, description}) do
+    %{
+      "type" => "array",
+      "description" => description,
+      "items" => to_open_api(def)
+    }
+  end
+
+  def to_open_api({:list, def}) do
+    %{
+      "type" => "array",
+      "items" => to_open_api(def)
+    }
+  end
+
+  def to_open_api({:oneof, objs}) do
+    %{"oneOf" => Enum.map(objs, &to_open_api/1)}
+  end
+
+  def to_open_api({:anyof, objs}) do
+    %{"anyOf" => Enum.map(objs, &to_open_api/1)}
+  end
+
+  def to_open_api({:enum, objs}) do
+    %{"oneOf" => Enum.map(objs, &to_open_api/1)}
+  end
+
+  def to_open_api({def, description}) when is_map(def) do
+    def = Map.to_list(def)
+
+    %{
+      "type" => "object",
+      "description" => description,
+      "properties" => to_properties(def),
+      "required" => required(def)
+      # "additionalProperties" => false
+    }
+  end
+
+  def to_open_api(def) when is_map(def) do
+    def = Map.to_list(def)
+
+    %{
+      "type" => "object",
+      "properties" => to_properties(def),
+      "required" => required(def)
+      # "additionalProperties" => false
+    }
+  end
+
+  def to_open_api(type), do: to_property(type)
+
+  def to_properties(def) do
+    def
+    |> Enum.map(fn {k, v} -> {Atom.to_string(k), to_property(v)} end)
+    |> Map.new()
+  end
+
+  def to_property({:list, obj}), do: %{"type" => "array", "items" => to_property(obj)}
+
+  def to_property({:list, obj, description}),
+    do: %{"type" => "array", "items" => to_property(obj), "description" => description}
+
+  # todo handle json_schema
+  def to_property(obj) when is_map(obj), do: to_open_api(obj)
+
+  def to_property(:string), do: %{"type" => "string"}
+  def to_property({:required, :string}), do: %{"type" => "string"}
+
+  def to_property({:string, description}), do: %{"type" => "string", "description" => description}
+
+  def to_property({:required, :string, description}),
+    do: %{"type" => "string", "description" => description}
+
+  def to_property(:integer), do: %{"type" => "integer"}
+  def to_property({:required, :integer}), do: %{"type" => "integer"}
+
+  def to_property({:integer, description}),
+    do: %{"type" => "integer", "description" => description}
+
+  def to_property({:required, :integer, description}),
+    do: %{"type" => "integer", "description" => description}
+
+  def to_property(:boolean), do: %{"type" => "boolean"}
+
+  def to_property({:boolean, description}),
+    do: %{"type" => "boolean", "description" => description}
+
+  def to_property({:required, :boolean}), do: %{"type" => "boolean"}
+
+  def to_property({:required, :boolean, description}),
+    do: %{"type" => "boolean", "description" => description}
+
+  def to_property({:oneof, [:string, nil], description}),
+    do: %{"type" => "string", "nullable" => true, "description" => description}
+
+  def to_property({:oneof, objs, description}),
+    do: %{"oneOf" => Enum.map(objs, &to_open_api/1), "description" => description}
+
+  def to_property({:oneof, objs}), do: %{"oneOf" => Enum.map(objs, &to_open_api/1)}
+
+  def to_property({:anyof, objs, description}),
+    do: %{"anyOf" => Enum.map(objs, &to_open_api/1), "description" => description}
+
+  def to_property({:anyof, objs}), do: %{"anyOf" => Enum.map(objs, &to_open_api/1)}
+
+  # todo handle description, default, none string enums and required
+
+  def to_property({:enum, enums}) do
+    %{"type" => "string", "enum" => enums}
+  end
+
+  def to_property({:required, property, description}) when is_tuple(property) do
+    to_property(Tuple.insert_at(property, tuple_size(property), description))
+  end
+
+  def to_property({:required, property}) when is_tuple(property) do
+    to_property(property)
+  end
+
+  def required(def) do
+    Enum.reduce(def, [], fn
+      {k, {:required, _type}}, acc -> [Atom.to_string(k) | acc]
+      {k, {:required, _type, _description}}, acc -> [Atom.to_string(k) | acc]
+      {k, {:required, :list, _type, _description}}, acc -> [Atom.to_string(k) | acc]
+      _, acc -> acc
+    end)
+  end
+
+  def to_json_schema(def, opts \\ [])
+
+  def to_json_schema(def, opts) when is_map(def) do
+    %{
+      "schema" => to_nested_json_schema(def)
+    }
+    |> merge_json_schema_opts(opts)
+  end
+
+  def to_json_schema({:list, def, description}, opts) do
+    wrap = Keyword.get(opts, :wrap_array_in_object, true)
+
+    if wrap do
+      %{
+        "schema" => %{
+          "type" => "object",
+          "properties" => %{
+            "list" => %{
+              "type" => "array",
+              "description" => description,
+              "items" => to_nested_json_schema(def)
+            }
+          },
+          "required" => ["list"],
+          "additionalProperties" => false
+        }
+      }
+      |> merge_json_schema_opts(opts)
+    else
+      %{
+        "schema" => %{
+          "type" => "array",
+          "description" => description,
+          "items" => to_nested_json_schema(def)
+        }
+      }
+      |> merge_json_schema_opts(opts)
+    end
+  end
+
+  def to_json_schema({:list, def}, opts) do
+    wrap = Keyword.get(opts, :wrap_array_in_object, true)
+
+    if wrap do
+      %{
+        "schema" => %{
+          "type" => "object",
+          "properties" => %{
+            "list" => %{
+              "type" => "array",
+              "items" => to_nested_json_schema(def)
+            }
+          },
+          "required" => ["list"],
+          "additionalProperties" => false
+        }
+      }
+      |> merge_json_schema_opts(opts)
+    else
+      %{
+        "schema" => %{
+          "type" => "array",
+          "items" => to_nested_json_schema(def)
+        }
+      }
+      |> merge_json_schema_opts(opts)
+    end
+  end
+
+  def maybe_unwrap_data(data, opts) do
+    schema_type = Keyword.get(opts, :schema_type)
+    wraped = Keyword.get(opts, :wrap_array_in_object)
+
+    case {schema_type, wraped, data} do
+      {:json_schema, true, %{"list" => list}} -> list
+      {_, _, data} -> data
+    end
+  end
+
+  defp merge_json_schema_opts(schema, opts) do
+    name = Keyword.get(opts, :name, "response")
+    description = Keyword.get(opts, :description)
+    strict = Keyword.get(opts, :strict, true)
+
+    schema
+    |> Map.merge(%{
+      "name" => name,
+      "description" => description,
+      "strict" => strict
+    })
+    |> Map.reject(&is_nil(elem(&1, 1)))
+  end
+
+  def to_nested_json_schema({:list, def, description}) do
+    %{
+      "type" => "array",
+      "description" => description,
+      "items" => to_nested_json_schema(def)
+    }
+  end
+
+  def to_nested_json_schema({:list, def}) do
+    %{
+      "type" => "array",
+      "items" => to_nested_json_schema(def)
+    }
+  end
+
+  def to_nested_json_schema({:oneof, objs}) do
+    %{"oneOf" => Enum.map(objs, &to_nested_json_schema/1)}
+  end
+
+  def to_nested_json_schema({:anyof, objs}) do
+    %{"anyOf" => Enum.map(objs, &to_nested_json_schema/1)}
+  end
+
+  def to_nested_json_schema({:enum, objs}) do
+    %{"oneOf" => Enum.map(objs, &to_nested_json_schema/1)}
+  end
+
+  def to_nested_json_schema({def, description}) when is_map(def) do
+    def = Map.to_list(def)
+
+    %{
+      "type" => "object",
+      "description" => description,
+      "properties" => to_json_schema_properties(def),
+      "required" => required(def),
+      "additionalProperties" => false
+    }
+  end
+
+  def to_nested_json_schema(def) when is_map(def) do
+    %{
+      "type" => "object",
+      "properties" => to_json_schema_properties(def),
+      "required" => required(def),
+      "additionalProperties" => false
+    }
+  end
+
+  def to_json_schema_properties(def) do
+    def
+    |> Enum.map(fn {k, v} -> {Atom.to_string(k), to_json_schema_property(v)} end)
+    |> Map.new()
+  end
+
+  def to_json_schema_property({:list, obj}),
+    do: %{"type" => "array", "items" => to_json_schema_property(obj)}
+
+  def to_json_schema_property({:list, obj, description}),
+    do: %{
+      "type" => "array",
+      "items" => to_json_schema_property(obj),
+      "description" => description
+    }
+
+  # todo handle json_schema
+  def to_json_schema_property(obj) when is_map(obj), do: to_nested_json_schema(obj)
+
+  def to_json_schema_property(:string), do: %{"type" => "string"}
+  def to_json_schema_property({:required, :string}), do: %{"type" => "string"}
+
+  def to_json_schema_property({:string, description}),
+    do: %{"type" => "string", "description" => description}
+
+  def to_json_schema_property({:required, :string, description}),
+    do: %{"type" => "string", "description" => description}
+
+  def to_json_schema_property(:integer), do: %{"type" => "integer"}
+  def to_json_schema_property({:required, :integer}), do: %{"type" => "integer"}
+
+  def to_json_schema_property({:integer, description}),
+    do: %{"type" => "integer", "description" => description}
+
+  def to_json_schema_property({:required, :integer, description}),
+    do: %{"type" => "integer", "description" => description}
+
+  def to_json_schema_property(:boolean), do: %{"type" => "boolean"}
+
+  def to_json_schema_property({:boolean, description}),
+    do: %{"type" => "boolean", "description" => description}
+
+  def to_json_schema_property({:required, :boolean}), do: %{"type" => "boolean"}
+
+  def to_json_schema_property({:required, :boolean, description}),
+    do: %{"type" => "boolean", "description" => description}
+
+  def to_json_schema_property({:oneof, objs, description}),
+    do: %{"oneOf" => Enum.map(objs, &to_nested_json_schema/1), "description" => description}
+
+  def to_json_schema_property({:oneof, objs}),
+    do: %{"oneOf" => Enum.map(objs, &to_nested_json_schema/1)}
+
+  def to_json_schema_property({:anyof, objs, description}),
+    do: %{"anyOf" => Enum.map(objs, &to_nested_json_schema/1), "description" => description}
+
+  def to_json_schema_property({:anyof, objs}),
+    do: %{"anyOf" => Enum.map(objs, &to_nested_json_schema/1)}
+
+  # todo handle description, default, none string enums and required
+  def to_json_schema_property({:enum, enums}) do
+    %{"type" => "string", "enum" => enums}
+  end
+
+  def to_json_schema_property({:required, property, description}) when is_tuple(property) do
+    to_json_schema_property(Tuple.insert_at(property, tuple_size(property), description))
+  end
+
+  def to_json_schema_property({:required, property}) when is_tuple(property) do
+    to_json_schema_property(property)
   end
 
   if Code.ensure_loaded?(Ecto) do
